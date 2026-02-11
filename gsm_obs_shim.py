@@ -22,6 +22,15 @@ except ImportError:
 import threading
 from PIL import Image
 
+def get_resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
 ARGS = None
 
 # Configure logging
@@ -488,10 +497,11 @@ async def mock_handler(websocket):
 
                         if raw_image_bytes is None:
                             try:
-                                with open("fake_image.jpg", "rb") as image_file:
+                                fake_img_path = get_resource_path("fake_image.jpg")
+                                with open(fake_img_path, "rb") as image_file:
                                     raw_image_bytes = image_file.read()
                             except FileNotFoundError:
-                                logger.error("fake_image.jpg not found, using placeholder")
+                                logger.error(f"fake_image.jpg not found at {fake_img_path}, using placeholder")
                                 # Fallback to 1x1 white pixel
                                 raw_image_bytes = base64.b64decode("/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wAALCAABAAEBAREA/8QAJgABAAAAAAAAAAAAAAAAAAAAAxABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAAPwBH/9k=")
 
@@ -604,10 +614,13 @@ async def main():
     if not ARGS.proxy:
         logger.info("Starting Portal Client for window selection...")
         try:
+            # Resolve path to portal_client.py (works when bundled)
+            portal_script = get_resource_path("portal_client.py")
+            
             # Use system python for dbus-python support
             # Use unbuffered output (-u) to ensure we get the ID immediately
             portal_process = subprocess.Popen(
-                ["/usr/bin/python3", "-u", "portal_client.py"],
+                ["/usr/bin/python3", "-u", portal_script],
                 stdout=subprocess.PIPE,
                 stderr=sys.stderr, # Pass stderr to console
                 text=True,

@@ -38,11 +38,33 @@ This application should be run within a Python virtual environment.
 pip install -r requirements.txt
 ```
 
+## Standalone Binary (PyInstaller)
+
+This application can be compiled into a single executable binary for easier distribution.
+
+### Building the Binary
+1. Ensure your virtual environment is active.
+2. Install dependencies (including `pyinstaller`):
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Run the PyInstaller build:
+   ```bash
+   pyinstaller gsm_obs_shim.spec
+   ```
+   The compiled binary will be located in the `dist/` directory.
+
 ## Running
 
+### From Python (Development)
 All commands should be executed within your virtual environment:
-- Mock Mode: python gsm_obs_shim.py
-- Proxy Mode: python gsm_obs_shim.py --proxy
+- Mock Mode: `python gsm_obs_shim.py`
+- Proxy Mode: `python gsm_obs_shim.py --proxy`
+
+### From Standalone Binary
+Run the generated binary from the `dist/` folder:
+- Mock Mode: `./dist/gsm_obs_shim`
+- Proxy Mode: `./dist/gsm_obs_shim --proxy`
 
 ## Contributing / Usage
 You are free to use this code as an example or inspiration for your own implementation. No support will be provided. Use at your own risk.
