@@ -4,6 +4,11 @@ import logging
 import signal
 import json
 import base64
+import subprocess
+import uuid
+import os
+import sys
+import msgpack
 
 import argparse
 
@@ -37,6 +42,53 @@ traffic_handler.setFormatter(logging.Formatter('%(message)s'))
 traffic_logger.addHandler(traffic_handler)
 
 shutdown_event = asyncio.Event()
+active_tasks = set()
+
+def log_traffic(message, source_name):
+    """Log traffic to file with truncation for large fields."""
+    prefix = "Client" if source_name == "GSM Client" else "Server"
+    try:
+        # Attempt to parse as JSON or MessagePack for pretty logging
+        if isinstance(message, bytes):
+            msg_obj = msgpack.unpackb(message, raw=False)
+        else:
+            msg_obj = json.loads(message)
+        
+        # Special handling for large image data to keep logs readable
+        if isinstance(msg_obj, dict) and msg_obj.get("op") == 7: # RequestResponse
+            d = msg_obj.get("d", {})
+            if isinstance(d, dict):
+                resp_data = d.get("responseData")
+                if isinstance(resp_data, dict) and resp_data.get("imageData"):
+                    img_data = resp_data["imageData"]
+                    if len(img_data) > 200:
+                        # Truncate for log only
+                        d_copy = d.copy()
+                        rd_copy = resp_data.copy()
+                        if isinstance(img_data, bytes):
+                            rd_copy["imageData"] = f"<BINARY_IMAGE_DATA_TRUNCATED_{len(img_data)}_BYTES>"
+                        else:
+                            rd_copy["imageData"] = f"<BASE64_IMAGE_DATA_TRUNCATED_{len(img_data)}_BYTES>"
+                        d_copy["responseData"] = rd_copy
+                        msg_obj_log = msg_obj.copy()
+                        msg_obj_log["d"] = d_copy
+                        log_content = json.dumps(msg_obj_log, indent=2, ensure_ascii=False)
+                    else:
+                        log_content = json.dumps(msg_obj, indent=2, ensure_ascii=False)
+                else:
+                    log_content = json.dumps(msg_obj, indent=2, ensure_ascii=False)
+            else:
+                log_content = json.dumps(msg_obj, indent=2, ensure_ascii=False)
+        else:
+            log_content = json.dumps(msg_obj, indent=2, ensure_ascii=False)
+    except Exception:
+        # Fallback to raw message if not JSON/MsgPack or parsing fails
+        log_content = message
+
+    log_msg = f"{prefix} -> {log_content}"
+    traffic_logger.info(log_msg)
+    for handler in traffic_logger.handlers:
+        handler.flush()
 
 async def forward(source: websockets.WebSocketServerProtocol | websockets.WebSocketClientProtocol, 
                   destination: websockets.WebSocketServerProtocol | websockets.WebSocketClientProtocol, 
@@ -46,13 +98,7 @@ async def forward(source: websockets.WebSocketServerProtocol | websockets.WebSoc
         async for message in source:
             logger.debug(f"Forwarding from {source_name}: {message}")
             
-            # Log traffic to file
-            prefix = "Client" if source_name == "GSM Client" else "Server"
-            log_msg = f"{prefix} -> {message}"
-            traffic_logger.info(log_msg)
-            for handler in traffic_logger.handlers:
-                handler.flush()
-            
+            log_traffic(message, source_name)
             await destination.send(message)
     except websockets.exceptions.ConnectionClosed as e:
         logger.info(f"Connection closed during forwarding {source_name}. Cause: {e}")
@@ -119,6 +165,18 @@ async def mock_handler(websocket):
     client_addr = websocket.remote_address
     logger.info(f"New connection from GSM Client (Mock Mode): {client_addr}")
     logger.info(f"Client Subprotocol: {websocket.subprotocol}")
+    logger.info(f"Client Headers: {websocket.request.headers}")
+
+    use_msgpack = (websocket.subprotocol == "obswebsocket.msgpack")
+    
+    # helper to send message with correct encoding and logging
+    async def send_msg(msg_obj):
+        if use_msgpack:
+            encoded = msgpack.packb(msg_obj)
+        else:
+            encoded = json.dumps(msg_obj)
+        log_traffic(encoded, "OBS Server")
+        await websocket.send(encoded)
 
     # Initial Hello (Op 0) - Server -> Client
     hello_msg = {
@@ -129,13 +187,20 @@ async def mock_handler(websocket):
             "rpcVersion": 1
         }
     }
-    await websocket.send(json.dumps(hello_msg))
-    logger.info("Sent Hello (Op 0)")
+    await send_msg(hello_msg)
+    logger.info(f"Sent Hello (Op 0) - {'MsgPack' if use_msgpack else 'JSON'}")
 
     try:
         async for message in websocket:
+            log_traffic(message, "GSM Client")
             try:
-                msg_json = json.loads(message)
+                if isinstance(message, bytes):
+                    msg_json = msgpack.unpackb(message, raw=False)
+                    use_msgpack = True # Switch if client sends msgpack
+                else:
+                    msg_json = json.loads(message)
+                    use_msgpack = False # Switch if client sends json
+                
                 op = msg_json.get("op")
                 
                 # Identify (Op 1) - Client -> Server
@@ -148,7 +213,7 @@ async def mock_handler(websocket):
                             "negotiatedRpcVersion": 1
                         }
                     }
-                    await websocket.send(json.dumps(identified_msg))
+                    await send_msg(identified_msg)
                     logger.info("Sent Identified (Op 2)")
                     continue
 
@@ -217,22 +282,18 @@ async def mock_handler(websocket):
                         response_data = {
                             "currentPreviewSceneName": None,
                             "currentPreviewSceneUuid": None,
-                            "currentProgramSceneName": "Cartagra",
+                            "currentProgramSceneName": ARGS.game_name,
                             "currentProgramSceneUuid": "3be8ae7c-585a-4b95-937f-89c691af657b",
                             "scenes": [
-                                {"sceneIndex": 0, "sceneName": "Cartagra", "sceneUuid": "3be8ae7c-585a-4b95-937f-89c691af657b"},
-                                {"sceneIndex": 1, "sceneName": "Desktop", "sceneUuid": "b865b2c7-3e9e-40a7-acd4-2a829cb6f385"},
-                                {"sceneIndex": 2, "sceneName": "Full Cam", "sceneUuid": "e0eb9735-d05d-4048-8a9d-9ee339328b35"},
-                                {"sceneIndex": 3, "sceneName": "Record", "sceneUuid": "b3b77a7a-6388-41d9-8f19-192cbf324180"},
-                                {"sceneIndex": 4, "sceneName": "Game No Cam", "sceneUuid": "eaa38977-65e7-4d1f-826f-6ee511507d8e"}
+                                {"sceneIndex": 0, "sceneName": ARGS.game_name, "sceneUuid": "3be8ae7c-585a-4b95-937f-89c691af657b"}
                             ]
                         }
 
                     elif request_type == "GetCurrentProgramScene":
                         response_data = {
-                            "currentProgramSceneName": "Cartagra",
+                            "currentProgramSceneName": ARGS.game_name,
                             "currentProgramSceneUuid": "3be8ae7c-585a-4b95-937f-89c691af657b",
-                            "sceneName": "Cartagra",
+                            "sceneName": ARGS.game_name,
                             "sceneUuid": "3be8ae7c-585a-4b95-937f-89c691af657b"
                         }
 
@@ -247,7 +308,7 @@ async def mock_handler(websocket):
                         }
 
                     elif request_type == "GetSceneItemList":
-                        # Return items for Cartagra scene
+                        # Return items for the configured game scene
                         response_data = {
                             "sceneItems": [
                                 {
@@ -292,14 +353,52 @@ async def mock_handler(websocket):
                          }
 
                     elif request_type == "GetSourceScreenshot":
-                        try:
-                            with open("fake_image.jpg", "rb") as image_file:
-                                encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-                                fake_image_data = f"data:image/jpeg;base64,{encoded_string}"
-                        except FileNotFoundError:
-                            logger.error("fake_image.jpg not found, using placeholder")
-                            # Fallback to 1x1 white pixel
-                            fake_image_data = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wAALCAABAAEBAREA/8QAJgABAAAAAAAAAAAAAAAAAAAAAxABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAAPwBH/9k="
+                        fake_image_data = None
+                        
+                        # Check if portal source is selected
+                        if hasattr(ARGS, 'portal_node_id') and ARGS.portal_node_id:
+                            try:
+                                node_id = ARGS.portal_node_id
+                                tmp_file = f"/tmp/capture_{uuid.uuid4().hex}.jpg"
+                                # gst-launch-1.0 pipewiresrc path=<ID> num-buffers=1 ! jpegenc ! filesink location=<FILE>
+                                cmd = [
+                                    "gst-launch-1.0", 
+                                    "pipewiresrc", f"path={node_id}", "num-buffers=1", 
+                                    "!", "videoconvert", # Ensure format compatibility
+                                    "!", "jpegenc", 
+                                    "!", "filesink", f"location={tmp_file}"
+                                ]
+                                
+                                logger.info(f"Capturing frame from Node {node_id}...")
+                                # Run capture
+                                try:
+                                    subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=2)
+                                except subprocess.CalledProcessError as e:
+                                    logger.error(f"GStreamer failed (Exit {e.returncode}):")
+                                    logger.error(f"STDOUT: {e.stdout}")
+                                    logger.error(f"STDERR: {e.stderr}")
+                                    raise
+                                
+                                with open(tmp_file, "rb") as f:
+                                    encoded_string = base64.b64encode(f.read()).decode('utf-8')
+                                    fake_image_data = encoded_string
+                                
+                                os.remove(tmp_file)
+                                logger.info("Frame captured successfully.")
+                                
+                            except Exception as e:
+                                logger.error(f"Failed to capture frame: {e}")
+                                # Fallback will kick in if fake_image_data is None
+
+                        if fake_image_data is None:
+                            try:
+                                with open("fake_image.jpg", "rb") as image_file:
+                                    encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                                    fake_image_data = encoded_string
+                            except FileNotFoundError:
+                                logger.error("fake_image.jpg not found, using placeholder")
+                                # Fallback to 1x1 white pixel
+                                fake_image_data = "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wAALCAABAAEBAREA/8QAJgABAAAAAAAAAAAAAAAAAAAAAxABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAAPwBH/9k="
                         
                         response_data = {
                             "imageData": fake_image_data,
@@ -326,24 +425,24 @@ async def mock_handler(websocket):
                             "requestType": request_type
                         }
                         
-                        # Only add responseData if it has content, or if request expects it (usually empty dict is fine too)
-                        # But log shows SetSceneItemTransform doesn't have it at all.
-                        if response_data or request_type != "SetSceneItemTransform":
+                        if response_data:
                             response_msg_d["responseData"] = response_data
+                        else:
+                            response_msg_d["responseData"] = {}
 
                         response_msg = {
                             "op": 7, # RequestResponse
                             "d": response_msg_d
                         }
 
-                        await websocket.send(json.dumps(response_msg))
+                        await send_msg(response_msg)
                         logger.info(f"Sent Response for {request_type} (ID: {request_id})")
                     else:
                         logger.warning(f"Unknown Request Type: {request_type}")
                         # Could send error response here but skipping for simplicity
                         
-            except json.JSONDecodeError:
-                logger.error("Failed to parse message as JSON")
+            except (json.JSONDecodeError, msgpack.UnpackException):
+                logger.error("Failed to parse message")
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
 
@@ -354,18 +453,62 @@ async def mock_handler(websocket):
 
 async def connection_handler(websocket):
     """Dispatch connection to appropriate handler based on mode."""
-    # Check if ARGS is initialized and proxy mode is requested
-    if ARGS and ARGS.proxy:
-        await proxy_handler(websocket)
-    else:
-        # Default to mock handler if ARGS is None or proxy is False
-        await mock_handler(websocket)
+    task = asyncio.current_task()
+    active_tasks.add(task)
+    try:
+        # Check if ARGS is initialized and proxy mode is requested
+        if ARGS and ARGS.proxy:
+            await proxy_handler(websocket)
+        else:
+            # Default to mock handler if ARGS is None or proxy is False
+            await mock_handler(websocket)
+    finally:
+        active_tasks.remove(task)
 
 async def main():
     global ARGS
     parser = argparse.ArgumentParser(description="GSM-OBS Shim")
     parser.add_argument("--proxy", action="store_true", help="Run in transparent proxy mode (connects to real OBS)")
+    parser.add_argument("--select-source", action="store_true", help="Select window using XDG Portal")
+    parser.add_argument("--game-name", help="Name of the game (required in mock mode)")
     ARGS = parser.parse_args()
+
+    if not ARGS.proxy and not ARGS.game_name:
+        parser.error("--game-name is required when not in proxy mode")
+    ARGS.portal_node_id = None
+
+    portal_process = None
+    if ARGS.select_source:
+        logger.info("Starting Portal Client for window selection...")
+        try:
+            # Use system python for dbus-python support
+            # Use unbuffered output (-u) to ensure we get the ID immediately
+            portal_process = subprocess.Popen(
+                ["/usr/bin/python3", "-u", "portal_client.py"],
+                stdout=subprocess.PIPE,
+                stderr=sys.stderr, # Pass stderr to console
+                text=True,
+                bufsize=1 
+            )
+            
+            logger.info("Please select a window/screen in the dialog if prompted...")
+            # Read Node ID
+            line = portal_process.stdout.readline()
+            if line:
+                try:
+                    val = line.strip()
+                    if val.isdigit():
+                        ARGS.portal_node_id = int(val)
+                        logger.info(f"Selected Source Node ID: {ARGS.portal_node_id}")
+                    else:
+                        logger.error(f"Portal client returned non-integer: {val}")
+                except ValueError:
+                    logger.error(f"Failed to parse Node ID from portal client: {line}")
+            else:
+                 logger.error("Portal client failed to return Node ID (empty output)")
+                 
+        except Exception as e:
+            logger.error(f"Failed to start portal client: {e}")
 
     loop = asyncio.get_running_loop()
     
@@ -393,18 +536,57 @@ async def main():
     # NOTE: The 'subprotocols' argument to serve is the list of supported protocols.
     # The 'select_subprotocol' argument is the strategy.
     
-    async with websockets.serve(
-        connection_handler, 
-        "127.0.0.1", 
-        GSM_CLIENT_PORT, 
-        ping_interval=None, 
-        subprotocols=OBS_SUBPROTOCOLS,
-        select_subprotocol=select_subprotocol,
-        max_size=10*1024*1024
-    ):
+    try:
+        server = await websockets.serve(
+            connection_handler, 
+            "127.0.0.1", 
+            GSM_CLIENT_PORT, 
+            ping_interval=None, 
+            subprotocols=OBS_SUBPROTOCOLS,
+            select_subprotocol=select_subprotocol,
+            max_size=10*1024*1024
+        )
         logger.info("Server started. Press Ctrl+C to stop.")
         await shutdown_event.wait()
-        logger.info("Shutting down...")
+        logger.info("Shutting down initiated...")
+    finally:
+        # 1. Terminate portal client immediately
+        if portal_process:
+            logger.info("Terminating portal client...")
+            portal_process.terminate()
+            # We will wait for it at the very end
+            
+        # 2. Close WebSocket server
+        if 'server' in locals():
+            logger.info("Closing WebSocket server...")
+            server.close()
+            
+            # Cancel all active connection tasks
+            if active_tasks:
+                logger.info(f"Cancelling {len(active_tasks)} active connection tasks...")
+                for task in active_tasks:
+                    task.cancel()
+                    
+            try:
+                # Wait for handlers to finish, but not forever
+                await asyncio.wait_for(server.wait_closed(), timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning("Timeout waiting for connections to close, forcing shutdown.")
+            except Exception as e:
+                logger.error(f"Error during server shutdown: {e}")
+
+        # 3. Final cleanup for portal process
+        if portal_process:
+            try:
+                portal_process.wait(timeout=1.0)
+                logger.info("Portal client terminated.")
+            except subprocess.TimeoutExpired:
+                logger.warning("Portal client didn't terminate, killing...")
+                portal_process.kill()
+                portal_process.wait()
+                logger.info("Portal client killed.")
+        
+        logger.info("Shutdown complete.")
 
 if __name__ == "__main__":
     try:
