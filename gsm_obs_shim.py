@@ -603,11 +603,7 @@ async def main():
     global ARGS
     parser = argparse.ArgumentParser(description="GSM-OBS Shim")
     parser.add_argument("--proxy", action="store_true", help="Run in transparent proxy mode (connects to real OBS)")
-    parser.add_argument("--game-name", help="Initial name of the game")
-    ARGS = parser.parse_args()
-
-    if ARGS.game_name:
-        GAME_STATE.set_name(ARGS.game_name)
+    ARGS, _ = parser.parse_known_args()
     ARGS.portal_node_id = None
 
     portal_process = None
