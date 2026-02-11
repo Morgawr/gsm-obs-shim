@@ -11,6 +11,16 @@ import sys
 import msgpack
 
 import argparse
+import pathlib
+import io
+try:
+    import tkinter as tk
+    from tkinter import ttk
+    GUI_AVAILABLE = True
+except ImportError:
+    GUI_AVAILABLE = False
+import threading
+from PIL import Image
 
 ARGS = None
 
@@ -33,6 +43,9 @@ OBS_SERVER_URI = "ws://127.0.0.1:7275"
 TRAFFIC_LOG_FILE = "/tmp/obs_proxy.log"
 OBS_SUBPROTOCOLS = ["obswebsocket.json", "obswebsocket.msgpack", "obs-websocket"]
 
+CONFIG_DIR = pathlib.Path.home() / ".config" / "gsm-obs-shim"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
 # Configure traffic logger
 traffic_logger = logging.getLogger("traffic")
 traffic_logger.setLevel(logging.INFO)
@@ -43,6 +56,93 @@ traffic_logger.addHandler(traffic_handler)
 
 shutdown_event = asyncio.Event()
 active_tasks = set()
+
+class GameState:
+    def __init__(self, initial_name="GSM-OBS Shim"):
+        self.game_name = initial_name
+        self._lock = threading.Lock()
+        self.load_config()
+
+    def set_name(self, name):
+        with self._lock:
+            self.game_name = name
+            logger.info(f"Game name updated to: {name}")
+            self.save_config()
+
+    def get_name(self):
+        with self._lock:
+            return self.game_name
+
+    def load_config(self):
+        try:
+            if CONFIG_FILE.exists():
+                with open(CONFIG_FILE, "r") as f:
+                    data = json.load(f)
+                    self.game_name = data.get("game_name", self.game_name)
+                    logger.info(f"Loaded game name from config: {self.game_name}")
+        except Exception as e:
+            logger.error(f"Failed to load config: {e}")
+
+    def save_config(self):
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(CONFIG_FILE, "w") as f:
+                json.dump({"game_name": self.game_name}, f)
+            logger.debug("Saved game name to config.")
+        except Exception as e:
+            logger.error(f"Failed to save config: {e}")
+
+GAME_STATE = GameState()
+
+class GameGui:
+    def __init__(self, game_state, shutdown_evt):
+        self.game_state = game_state
+        self.shutdown_evt = shutdown_evt
+        self.root = None
+        self.name_var = None
+        self.entry = None
+        self.update_btn = None
+
+    def start(self):
+        self.root = tk.Tk()
+        self.root.title("GSM-OBS Shim Control")
+        self.root.geometry("400x150")
+        
+        main_frame = ttk.Frame(self.root, padding="20")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(main_frame, text="Game Name:").pack(pady=(0, 5))
+        
+        self.name_var = tk.StringVar(value=self.game_state.get_name())
+        self.entry = ttk.Entry(main_frame, textvariable=self.name_var, width=40)
+        self.entry.pack(pady=(0, 10))
+        self.entry.bind("<Return>", lambda e: self.update_name())
+
+        self.update_btn = ttk.Button(main_frame, text="Update", command=self.update_name)
+        self.update_btn.pack()
+
+        # Handle window close
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+        # Check for external shutdown
+        self.check_shutdown()
+        
+        self.root.mainloop()
+
+    def update_name(self):
+        new_name = self.name_var.get()
+        self.game_state.set_name(new_name)
+
+    def check_shutdown(self):
+        if self.shutdown_evt.is_set():
+            self.root.destroy()
+        else:
+            self.root.after(500, self.check_shutdown)
+
+    def on_close(self):
+        logger.info("GUI closed. Initiating shutdown...")
+        self.shutdown_evt.set()
+        self.root.destroy()
 
 def log_traffic(message, source_name):
     """Log traffic to file with truncation for large fields."""
@@ -279,21 +379,23 @@ async def mock_handler(websocket):
                         }
                     
                     elif request_type == "GetSceneList":
+                        game_name = GAME_STATE.get_name()
                         response_data = {
                             "currentPreviewSceneName": None,
                             "currentPreviewSceneUuid": None,
-                            "currentProgramSceneName": ARGS.game_name,
+                            "currentProgramSceneName": game_name,
                             "currentProgramSceneUuid": "3be8ae7c-585a-4b95-937f-89c691af657b",
                             "scenes": [
-                                {"sceneIndex": 0, "sceneName": ARGS.game_name, "sceneUuid": "3be8ae7c-585a-4b95-937f-89c691af657b"}
+                                {"sceneIndex": 0, "sceneName": game_name, "sceneUuid": "3be8ae7c-585a-4b95-937f-89c691af657b"}
                             ]
                         }
 
                     elif request_type == "GetCurrentProgramScene":
+                        game_name = GAME_STATE.get_name()
                         response_data = {
-                            "currentProgramSceneName": ARGS.game_name,
+                            "currentProgramSceneName": game_name,
                             "currentProgramSceneUuid": "3be8ae7c-585a-4b95-937f-89c691af657b",
-                            "sceneName": ARGS.game_name,
+                            "sceneName": game_name,
                             "sceneUuid": "3be8ae7c-585a-4b95-937f-89c691af657b"
                         }
 
@@ -354,51 +456,73 @@ async def mock_handler(websocket):
 
                     elif request_type == "GetSourceScreenshot":
                         fake_image_data = None
+                        request_data = d.get("requestData", {})
+                        target_width = request_data.get("imageWidth")
+                        target_height = request_data.get("imageHeight")
                         
                         # Check if portal source is selected
+                        raw_image_bytes = None
                         if hasattr(ARGS, 'portal_node_id') and ARGS.portal_node_id:
                             try:
                                 node_id = ARGS.portal_node_id
                                 tmp_file = f"/tmp/capture_{uuid.uuid4().hex}.jpg"
-                                # gst-launch-1.0 pipewiresrc path=<ID> num-buffers=1 ! jpegenc ! filesink location=<FILE>
                                 cmd = [
                                     "gst-launch-1.0", 
                                     "pipewiresrc", f"path={node_id}", "num-buffers=1", 
-                                    "!", "videoconvert", # Ensure format compatibility
+                                    "!", "videoconvert", 
                                     "!", "jpegenc", 
                                     "!", "filesink", f"location={tmp_file}"
                                 ]
                                 
                                 logger.info(f"Capturing frame from Node {node_id}...")
-                                # Run capture
-                                try:
-                                    subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=2)
-                                except subprocess.CalledProcessError as e:
-                                    logger.error(f"GStreamer failed (Exit {e.returncode}):")
-                                    logger.error(f"STDOUT: {e.stdout}")
-                                    logger.error(f"STDERR: {e.stderr}")
-                                    raise
+                                subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=2)
                                 
                                 with open(tmp_file, "rb") as f:
-                                    encoded_string = base64.b64encode(f.read()).decode('utf-8')
-                                    fake_image_data = encoded_string
+                                    raw_image_bytes = f.read()
                                 
                                 os.remove(tmp_file)
                                 logger.info("Frame captured successfully.")
                                 
                             except Exception as e:
                                 logger.error(f"Failed to capture frame: {e}")
-                                # Fallback will kick in if fake_image_data is None
 
-                        if fake_image_data is None:
+                        if raw_image_bytes is None:
                             try:
                                 with open("fake_image.jpg", "rb") as image_file:
-                                    encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-                                    fake_image_data = encoded_string
+                                    raw_image_bytes = image_file.read()
                             except FileNotFoundError:
                                 logger.error("fake_image.jpg not found, using placeholder")
                                 # Fallback to 1x1 white pixel
-                                fake_image_data = "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wAALCAABAAEBAREA/8QAJgABAAAAAAAAAAAAAAAAAAAAAxABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAAPwBH/9k="
+                                raw_image_bytes = base64.b64decode("/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wAALCAABAAEBAREA/8QAJgABAAAAAAAAAAAAAAAAAAAAAxABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAAPwBH/9k=")
+
+                        if raw_image_bytes:
+                            # Apply resizing if requested
+                            if target_width or target_height:
+                                try:
+                                    img = Image.open(io.BytesIO(raw_image_bytes))
+                                    original_width, original_height = img.size
+                                    
+                                    # Calculate new dimensions
+                                    if target_width and target_height:
+                                        new_width, new_height = target_width, target_height
+                                    elif target_width:
+                                        new_width = target_width
+                                        new_height = int(original_height * (target_width / original_width))
+                                    else: # target_height
+                                        new_height = target_height
+                                        new_width = int(original_width * (target_height / original_height))
+                                    
+                                    logger.info(f"Resizing screenshot from {original_width}x{original_height} to {new_width}x{new_height}")
+                                    img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                                    
+                                    img_byte_arr = io.BytesIO()
+                                    img.save(img_byte_arr, format='JPEG')
+                                    raw_image_bytes = img_byte_arr.getvalue()
+                                except Exception as e:
+                                    logger.error(f"Failed to resize image: {e}")
+                                    # Fall back to original bytes if resizing fails
+
+                            fake_image_data = base64.b64encode(raw_image_bytes).decode('utf-8')
                         
                         response_data = {
                             "imageData": fake_image_data,
@@ -469,16 +593,15 @@ async def main():
     global ARGS
     parser = argparse.ArgumentParser(description="GSM-OBS Shim")
     parser.add_argument("--proxy", action="store_true", help="Run in transparent proxy mode (connects to real OBS)")
-    parser.add_argument("--select-source", action="store_true", help="Select window using XDG Portal")
-    parser.add_argument("--game-name", help="Name of the game (required in mock mode)")
+    parser.add_argument("--game-name", help="Initial name of the game")
     ARGS = parser.parse_args()
 
-    if not ARGS.proxy and not ARGS.game_name:
-        parser.error("--game-name is required when not in proxy mode")
+    if ARGS.game_name:
+        GAME_STATE.set_name(ARGS.game_name)
     ARGS.portal_node_id = None
 
     portal_process = None
-    if ARGS.select_source:
+    if not ARGS.proxy:
         logger.info("Starting Portal Client for window selection...")
         try:
             # Use system python for dbus-python support
@@ -521,6 +644,15 @@ async def main():
 
     mode_str = "Proxy Mode" if ARGS.proxy else "Mock Server Mode"
     logger.info(f"Starting GSM-OBS Shim on port {GSM_CLIENT_PORT} ({mode_str})...")
+
+    # Start GUI in a separate thread if available
+    if GUI_AVAILABLE:
+        gui = GameGui(GAME_STATE, shutdown_event)
+        gui_thread = threading.Thread(target=gui.start, daemon=True)
+        gui_thread.start()
+    else:
+        logger.warning("Tkinter not found. GUI will not be available. Using fallback game name: %s", GAME_STATE.get_name())
+        logger.info("To enable GUI, install python3-tk: sudo apt-get install python3-tk")
     
     def select_subprotocol(connection, client_subprotocols):
         # Allow connections that don't request a subprotocol
